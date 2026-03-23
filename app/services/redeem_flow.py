@@ -298,10 +298,13 @@ class RedeemFlowService:
                             rc.status = "used"
                             rc.used_by_email = email
                             rc.used_team_id = team_id_final
-                            rc.used_at = get_now()
-                            if rc.has_warranty:
+                            # 仅在首次使用时记录 used_at，质保重复兑换时不覆盖，
+                            # 以保证质保期从首次兑换时起算，不随每次续兑而顺延
+                            if not rc.used_at:
+                                rc.used_at = get_now()
+                            if rc.has_warranty and not rc.warranty_expires_at:
                                 days = rc.warranty_days or 30
-                                rc.warranty_expires_at = get_now() + timedelta(days=days)
+                                rc.warranty_expires_at = rc.used_at + timedelta(days=days)
 
                             record = RedemptionRecord(
                                 email=email,

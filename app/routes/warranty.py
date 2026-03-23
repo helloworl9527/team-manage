@@ -45,6 +45,7 @@ class WarrantyCheckResponse(BaseModel):
     warranty_valid: bool
     warranty_expires_at: Optional[str]
     banned_teams: list
+    expired_teams: list = []
     can_reuse: bool
     original_code: Optional[str]
     records: list[WarrantyCheckRecord] = []
@@ -89,6 +90,7 @@ async def check_warranty(
             warranty_valid=result.get("warranty_valid", False),
             warranty_expires_at=result.get("warranty_expires_at"),
             banned_teams=result.get("banned_teams", []),
+            expired_teams=result.get("expired_teams", []),
             can_reuse=result.get("can_reuse", False),
             original_code=result.get("original_code"),
             records=result.get("records", []),
