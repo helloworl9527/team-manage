@@ -167,6 +167,7 @@ class WarrantyService:
             # 2. 处理记录并进行必要的实时同步
             final_records = []
             banned_teams_info = []
+            expired_teams_info = []
             has_any_warranty = False
             primary_warranty_valid = False
             primary_expiry = None
@@ -225,6 +226,19 @@ class WarrantyService:
                         "banned_at": team.last_sync.isoformat() if team.last_sync else None
                     })
 
+                # 记录到期但未封号 Team
+                if (
+                    team.expires_at
+                    and team.expires_at < get_now()
+                    and team.status != "banned"
+                ):
+                    expired_teams_info.append({
+                        "team_id": team.id,
+                        "team_name": team.team_name,
+                        "email": team.email,
+                        "expires_at": team.expires_at.isoformat()
+                    })
+
                 final_records.append({
                     "code": code_obj.code,
                     "has_warranty": code_obj.has_warranty,
@@ -240,8 +254,10 @@ class WarrantyService:
                     "device_code_auth_enabled": team.device_code_auth_enabled
                 })
 
-            # 3. 判断是否可以重复使用 (只要有有效的质保码且有被封的 Team)
-            if has_any_warranty and primary_warranty_valid and len(banned_teams_info) > 0:
+            # 3. 判断是否可以重复使用 (有有效质保码且存在被封的 Team 或到期未封号的 Team)
+            if has_any_warranty and primary_warranty_valid and (
+                len(banned_teams_info) > 0 or len(expired_teams_info) > 0
+            ):
                 # 进一步验证 (使用现有的 validate_warranty_reuse 逻辑)
                 # 这里为了简单直接复用逻辑判断
                 can_reuse = True
@@ -259,6 +275,7 @@ class WarrantyService:
                 "warranty_valid": primary_warranty_valid,
                 "warranty_expires_at": primary_expiry.isoformat() if primary_expiry else None,
                 "banned_teams": banned_teams_info,
+                "expired_teams": expired_teams_info,
                 "can_reuse": can_reuse,
                 "original_code": primary_code,
                 "records": final_records,
