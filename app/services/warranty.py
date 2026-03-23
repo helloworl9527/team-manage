@@ -403,24 +403,6 @@ class WarrantyService:
                     "error": None
                 }
 
-            # 5. 检查用户当前是否已在有效的 Team 中
-            # 逻辑：如果最近一次加入的 Team 仍然有效（active/full 且未过期），则不允许重复使用
-            for record in records:
-                stmt = select(Team).where(Team.id == record.team_id)
-                result = await db_session.execute(stmt)
-                team = result.scalar_one_or_none()
-                
-                if team:
-                    # 如果有任何一个关联 Team 还是 active/full 状态，且未过期
-                    is_expired = team.expires_at and team.expires_at < get_now()
-                    if team.status in ["active", "full"] and not is_expired:
-                        return {
-                            "success": True,
-                            "can_reuse": False,
-                            "reason": f"您已在有效 Team 中 ({team.team_name or team.id})，不可重复兑换",
-                            "error": None
-                        }
-
             # 6. 已确认没有活跃的 Team，质保有效，允许重复兑换
             # 无论之前的 Team 是被封号、正常到期还是已删除，质保期内均可重复使用
             has_eligible_history = False
@@ -429,7 +411,7 @@ class WarrantyService:
                 result = await db_session.execute(stmt)
                 team = result.scalar_one_or_none()
                 if team is None or team.status == "banned" or (
-                    team.status != "banned" and team.expires_at and team.expires_at < get_now()
+                    team.expires_at and team.expires_at < get_now()
                 ):
                     has_eligible_history = True
                     break
