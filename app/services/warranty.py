@@ -421,27 +421,30 @@ class WarrantyService:
                             "error": None
                         }
 
-            # 6. 检查是否有过被封的记录
-            has_banned_team = False
+            # 6. 已确认没有活跃的 Team，质保有效，允许重复兑换
+            # 无论之前的 Team 是被封号、正常到期还是已删除，质保期内均可重复使用
+            has_eligible_history = False
             for record in records:
                 stmt = select(Team).where(Team.id == record.team_id)
                 result = await db_session.execute(stmt)
                 team = result.scalar_one_or_none()
-                if team and team.status == "banned":
-                    has_banned_team = True
+                if team is None or team.status == "banned" or (
+                    team.status != "banned" and team.expires_at and team.expires_at < get_now()
+                ):
+                    has_eligible_history = True
                     break
-            if has_banned_team:
+            if has_eligible_history:
                 return {
                     "success": True,
                     "can_reuse": True,
-                    "reason": "之前加入的 Team 已封号，可使用质保重复兑换",
+                    "reason": "之前加入的 Team 已到期或封号，可在质保期内重复兑换",
                     "error": None
                 }
             else:
                 return {
                     "success": True,
                     "can_reuse": False,
-                    "reason": "未找到被封号记录，且质保不支持正常过期或异常提示的重复兑换",
+                    "reason": "质保记录状态异常，无法确认是否可重复兑换",
                     "error": None
                 }
 
