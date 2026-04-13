@@ -149,6 +149,11 @@ def run_auto_migration():
             cursor.execute("ALTER TABLE teams ADD COLUMN device_code_auth_enabled BOOLEAN DEFAULT 0")
             migrations_applied.append("teams.device_code_auth_enabled")
 
+        if not column_exists(cursor, "teams", "pending_invites"):
+            logger.info("添加 teams.pending_invites 字段")
+            cursor.execute("ALTER TABLE teams ADD COLUMN pending_invites INTEGER DEFAULT 0")
+            migrations_applied.append("teams.pending_invites")
+
         repaired_codes = repair_warranty_timestamps(cursor)
         if repaired_codes:
             migrations_applied.append(f"repair.warranty_timestamps({repaired_codes})")

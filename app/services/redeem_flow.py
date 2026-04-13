@@ -119,19 +119,22 @@ class RedeemFlowService:
         """
         try:
             # 查找所有 active 且未满的 Team
-            stmt = select(Team).where(
-                Team.status == "active",
-                Team.current_members < Team.max_members
-            )
+            stmt = select(Team).where(Team.status == "active")
             
             if exclude_team_ids:
                 stmt = stmt.where(Team.id.not_in(exclude_team_ids))
-            
-            # 优先选择人数最少的 Team (负载均衡)
-            stmt = stmt.order_by(Team.current_members.asc(), Team.created_at.desc())
-            
+
             result = await db_session.execute(stmt)
-            team = result.scalars().first()
+            teams = [team for team in result.scalars().all() if self.team_service._remaining_slots(team) > 0]
+
+            # 优先选择已占用席位最少的 Team (负载均衡)，同占用量时优先较新的 Team
+            teams.sort(
+                key=lambda team: (
+                    self.team_service._occupied_slots(team),
+                    -(team.created_at.timestamp() if team.created_at else 0),
+                )
+            )
+            team = teams[0] if teams else None
 
             if not team:
                 reason = "没有可用的 Team"
@@ -238,7 +241,7 @@ class RedeemFlowService:
                             if not target_team or target_team.status != "active":
                                 raise Exception(f"目标 Team {team_id_final} 不可用 ({target_team.status if target_team else 'None'})")
                             
-                            if target_team.current_members >= target_team.max_members:
+                            if self.team_service._occupied_slots(target_team) >= target_team.max_members:
                                 target_team.status = "full"
                                 raise Exception("该 Team 已满, 请选择其他 Team 尝试")
 
@@ -316,8 +319,8 @@ class RedeemFlowService:
                                 redeemed_at=redemption_time
                             )
                             db_session.add(record)
-                            target_team.current_members += 1
-                            if target_team.current_members >= target_team.max_members:
+                            target_team.pending_invites = (target_team.pending_invites or 0) + 1
+                            if self.team_service._occupied_slots(target_team) >= target_team.max_members:
                                 target_team.status = "full"
                             
                             await db_session.commit()

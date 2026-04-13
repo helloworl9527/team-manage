@@ -26,6 +26,7 @@ class Team(Base):
     subscription_plan = Column(String(100), comment="订阅计划")
     expires_at = Column(DateTime, comment="订阅到期时间")
     current_members = Column(Integer, default=0, comment="当前成员数")
+    pending_invites = Column(Integer, default=0, comment="待接受邀请数")
     max_members = Column(Integer, default=6, comment="最大成员数")
     status = Column(String(20), default="active", comment="状态: active/full/expired/error/banned")
     account_role = Column(String(50), comment="账号角色: account-owner/standard-user 等")

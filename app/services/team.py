@@ -30,6 +30,18 @@ class TeamService:
         self.token_parser = TokenParser()
         self.jwt_parser = JWTParser()
 
+    @staticmethod
+    def _pending_invites(team: Team) -> int:
+        return team.pending_invites or 0
+
+    @classmethod
+    def _occupied_slots(cls, team: Team) -> int:
+        return (team.current_members or 0) + cls._pending_invites(team)
+
+    @classmethod
+    def _remaining_slots(cls, team: Team) -> int:
+        return max((team.max_members or 0) - cls._occupied_slots(team), 0)
+
     async def _handle_api_error(self, result: Dict[str, Any], team: Team, db_session: AsyncSession) -> bool:
         """
         检查结果是否表示账号被封禁、Token 失效或 Team 已满,如果是则更新状态
@@ -98,13 +110,11 @@ class TeamService:
         if any(kw in error_msg for kw in full_keywords):
             logger.warning(f"检测到 Team 席位已满 (msg={error_msg}), 更新 Team {team.id} ({team.email}) 状态为 full")
             team.status = "full"
+            occupied_slots = self._occupied_slots(team)
             # 学习真实的席位上限: 如果当前探测到的成员数小于预设的最大值，说明该团队实际容量较小
-            if team.current_members > 0 and team.current_members < team.max_members:
-                logger.info(f"修正 Team {team.id} 的最大成员数: {team.max_members} -> {team.current_members}")
-                team.max_members = team.current_members
-            elif team.current_members >= team.max_members:
-                # 进位修正，确保逻辑闭环
-                team.current_members = team.max_members
+            if occupied_slots > 0 and occupied_slots < team.max_members:
+                logger.info(f"修正 Team {team.id} 的最大成员数: {team.max_members} -> {occupied_slots}")
+                team.max_members = occupied_slots
 
             if not db_session.in_transaction():
                 await db_session.commit()
@@ -151,7 +161,7 @@ class TeamService:
         team.error_count = 0
         if team.status == "error":
             # 恢复时也要校验是否满员或到期
-            if team.current_members >= team.max_members:
+            if self._occupied_slots(team) >= team.max_members:
                 logger.info(f"Team {team.id} ({team.email}) 请求成功, 将状态从 error 恢复为 full")
                 team.status = "full"
             elif team.expires_at and team.expires_at < datetime.now():
@@ -434,10 +444,12 @@ class TeamService:
                 )
 
                 current_members = 0
+                pending_invites = 0
                 if members_result["success"]:
-                    current_members += members_result["total"]
+                    current_members = members_result["total"]
                 if invites_result["success"]:
-                    current_members += invites_result["total"]
+                    pending_invites = invites_result["total"]
+                occupied_slots = current_members + pending_invites
 
                 # 解析过期时间
                 expires_at = None
@@ -465,7 +477,7 @@ class TeamService:
                 # 确定状态和最大成员数 (默认 6)
                 max_members = 6
                 status = "active"
-                if current_members >= max_members:
+                if occupied_slots >= max_members:
                     status = "full"
                 elif expires_at and expires_at < datetime.now():
                     status = "expired"
@@ -489,6 +501,7 @@ class TeamService:
                     subscription_plan=selected_account["subscription_plan"],
                     expires_at=expires_at,
                     current_members=current_members,
+                    pending_invites=pending_invites,
                     max_members=max_members,
                     status=status,
                     account_role=selected_account.get("account_user_role"),
@@ -638,7 +651,7 @@ class TeamService:
             
             # 自动维护 active/full/expired 状态 (仅当当前处于这三者之一或刚更新了 max_members/status)
             if team.status in ["active", "full", "expired"]:
-                if team.current_members >= team.max_members:
+                if self._occupied_slots(team) >= team.max_members:
                     team.status = "full"
                 elif team.expires_at and team.expires_at < datetime.now():
                     team.status = "expired"
@@ -974,14 +987,15 @@ class TeamService:
 
             all_member_emails = set()
             current_members = 0
+            pending_invites = 0
             if members_result["success"]:
-                current_members += members_result["total"]
+                current_members = members_result["total"]
                 for m in members_result.get("members", []):
                     if m.get("email"):
                         all_member_emails.add(m["email"].lower())
             
             if invites_result["success"]:
-                current_members += invites_result["total"]
+                pending_invites = invites_result["total"]
                 for inv in invites_result.get("items", []):
                     if inv.get("email_address"):
                         all_member_emails.add(inv["email_address"].lower())
@@ -1036,7 +1050,8 @@ class TeamService:
 
             # 7. 确定状态
             status = "active"
-            if current_members >= team.max_members:
+            occupied_slots = current_members + pending_invites
+            if occupied_slots >= team.max_members:
                 status = "full"
             elif expires_at and expires_at < datetime.now():
                 status = "expired"
@@ -1049,6 +1064,7 @@ class TeamService:
             team.account_role = current_account.get("account_user_role")
             team.expires_at = expires_at
             team.current_members = current_members
+            team.pending_invites = pending_invites
             team.status = status
             team.device_code_auth_enabled = device_code_auth_enabled
             team.error_count = 0  # 同步成功，重置错误次数
@@ -1059,11 +1075,13 @@ class TeamService:
             else:
                 await db_session.flush()
 
-            logger.info(f"Team 同步成功: ID {team_id}, 成员数 {current_members}")
+            logger.info(
+                f"Team 同步成功: ID {team_id}, 已加入成员 {current_members}, 待接受邀请 {pending_invites}"
+            )
 
             return {
                 "success": True,
-                "message": f"同步成功,当前成员数: {current_members}",
+                "message": f"同步成功,已加入成员: {current_members}, 待接受邀请: {pending_invites}",
                 "member_emails": list(all_member_emails),
                 "error": None
             }
@@ -1427,6 +1445,15 @@ class TeamService:
                     "error": "Team 已过期,无法添加成员"
                 }
 
+            if self._occupied_slots(team) >= team.max_members:
+                team.status = "full"
+                await db_session.commit()
+                return {
+                    "success": False,
+                    "message": None,
+                    "error": "Team 已满,无法添加成员"
+                }
+
             # 3. 确保 AT Token 有效
             access_token = await self.ensure_access_token(team, db_session)
             if not access_token:
@@ -1475,6 +1502,11 @@ class TeamService:
                     "message": None,
                     "error": "Team账号受限: 官方拦截下发(响应空列表)，请检查账单/风控状态"
                 }
+
+            team.pending_invites = (team.pending_invites or 0) + 1
+            if self._occupied_slots(team) >= team.max_members:
+                team.status = "full"
+            await db_session.commit()
 
             # 5. 更新成员数并二次校验邀请是否真的生效 (循环检测 3 次，防止接口返回 200 但实际延迟入库)
             is_verified = False
@@ -1675,21 +1707,22 @@ class TeamService:
             结果字典,包含 success, teams, error
         """
         try:
-            # 查询 status='active' 且 current_members < max_members 的 Team
-            stmt = select(Team).where(
-                Team.status == "active",
-                Team.current_members < Team.max_members
-            )
+            # 查询所有活跃 Team，再基于已加入成员和待接受邀请做容量过滤
+            stmt = select(Team).where(Team.status == "active")
             result = await db_session.execute(stmt)
             teams = result.scalars().all()
 
             # 构建返回数据 (不包含敏感信息)
             team_list = []
             for team in teams:
+                if self._remaining_slots(team) <= 0:
+                    continue
                 team_list.append({
                     "id": team.id,
                     "team_name": team.team_name,
                     "current_members": team.current_members,
+                    "pending_invites": self._pending_invites(team),
+                    "occupied_slots": self._occupied_slots(team),
                     "max_members": team.max_members,
                     "expires_at": team.expires_at.isoformat() if team.expires_at else None,
                     "subscription_plan": team.subscription_plan
@@ -1773,6 +1806,8 @@ class TeamService:
                 "subscription_plan": team.subscription_plan,
                 "expires_at": team.expires_at.isoformat() if team.expires_at else None,
                 "current_members": team.current_members,
+                "pending_invites": self._pending_invites(team),
+                "occupied_slots": self._occupied_slots(team),
                 "max_members": team.max_members,
                 "status": team.status,
                 "device_code_auth_enabled": team.device_code_auth_enabled,
@@ -1881,6 +1916,8 @@ class TeamService:
                     "subscription_plan": team.subscription_plan,
                     "expires_at": team.expires_at.isoformat() if team.expires_at else None,
                     "current_members": team.current_members,
+                    "pending_invites": self._pending_invites(team),
+                    "occupied_slots": self._occupied_slots(team),
                     "max_members": team.max_members,
                     "status": team.status,
                     "device_code_auth_enabled": getattr(team, 'device_code_auth_enabled', False),
@@ -2014,12 +2051,10 @@ class TeamService:
         """
         try:
             # 统计所有状态为 active 的 Team 的剩余位置
-            stmt = select(func.sum(Team.max_members - Team.current_members)).where(
-                Team.status == "active",
-                Team.current_members < Team.max_members
-            )
+            stmt = select(Team).where(Team.status == "active")
             result = await db_session.execute(stmt)
-            return result.scalar() or 0
+            teams = result.scalars().all()
+            return sum(self._remaining_slots(team) for team in teams)
         except Exception as e:
             logger.error(f"获取总可用车位数失败: {e}")
             return 0
@@ -2036,12 +2071,10 @@ class TeamService:
             total = total_result.scalar() or 0
             
             # 可用 Team 数 (状态为 active 且未满)
-            available_stmt = select(func.count(Team.id)).where(
-                Team.status == "active",
-                Team.current_members < Team.max_members
-            )
+            available_stmt = select(Team).where(Team.status == "active")
             available_result = await db_session.execute(available_stmt)
-            available = available_result.scalar() or 0
+            available_teams = available_result.scalars().all()
+            available = sum(1 for team in available_teams if self._remaining_slots(team) > 0)
             
             return {
                 "total": total,
