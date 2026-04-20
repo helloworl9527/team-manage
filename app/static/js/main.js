@@ -245,6 +245,8 @@ async function handleBatchImport(event) {
 
     submitButton.disabled = true;
     submitButton.textContent = '导入中...';
+    let receivedAnyEvent = false;
+    let receivedFinishEvent = false;
 
     try {
         const response = await fetch('/admin/teams/import', {
@@ -263,74 +265,102 @@ async function handleBatchImport(event) {
             throw new Error(errorData.error || errorData.detail || '请求失败');
         }
 
-        const reader = response.body.getReader();
-        const decoder = new TextDecoder();
-        let buffer = '';
+        const applyBatchEvent = (data) => {
+            receivedAnyEvent = true;
+            if (data.type === 'start') {
+                progressStage.textContent = `开始导入 (共 ${data.total} 条)...`;
+            } else if (data.type === 'progress') {
+                const percent = Math.round((data.current / data.total) * 100);
+                progressBar.style.width = `${percent}%`;
+                progressPercent.textContent = `${percent}%`;
+                progressStage.textContent = `正在导入 ${data.current}/${data.total}...`;
+                successCountEl.textContent = data.success_count;
+                failedCountEl.textContent = data.failed_count;
 
-        while (true) {
-            const { value, done } = await reader.read();
-            if (done) break;
-
-            buffer += decoder.decode(value, { stream: true });
-            const lines = buffer.split('\n');
-            buffer = lines.pop(); // 最后一个可能是残缺的
-
-            for (const line of lines) {
-                if (!line.trim()) continue;
-                try {
-                    const data = JSON.parse(line);
-
-                    if (data.type === 'start') {
-                        progressStage.textContent = `开始导入 (共 ${data.total} 条)...`;
-                    } else if (data.type === 'progress') {
-                        const percent = Math.round((data.current / data.total) * 100);
-                        progressBar.style.width = `${percent}%`;
-                        progressPercent.textContent = `${percent}%`;
-                        progressStage.textContent = `正在导入 ${data.current}/${data.total}...`;
-                        successCountEl.textContent = data.success_count;
-                        failedCountEl.textContent = data.failed_count;
-
-                        // 实时添加到详情列表
-                        if (data.last_result) {
-                            resultsContainer.style.display = 'block';
-                            const res = data.last_result;
-                            const statusClass = res.success ? 'text-success' : 'text-danger';
-                            const statusText = res.success ? '成功' : '失败';
-                            const row = document.createElement('tr');
-                            row.innerHTML = `
-                                <td>${res.email}</td>
-                                <td class="${statusClass}">${statusText}</td>
-                                <td>${res.success ? (res.message || '导入成功') : res.error}</td>
-                            `;
-                            // 插入到最前面，方便看到最新的
-                            resultsBody.insertBefore(row, resultsBody.firstChild);
-                        }
-                    } else if (data.type === 'finish') {
-                        progressStage.textContent = '导入完成';
-                        progressBar.style.width = '100%';
-                        progressPercent.textContent = '100%';
-                        finalSummaryEl.textContent = `总数: ${data.total} | 成功: ${data.success_count} | 失败: ${data.failed_count}`;
-
-                        if (data.failed_count === 0) {
-                            showToast('全部导入成功！', 'success');
-                        } else {
-                            showToast(`导入完成，成功 ${data.success_count} 条，失败 ${data.failed_count} 条`, 'warning');
-                        }
-
-                        // 刷新页面以显示新数据
-                        if (data.success_count > 0) {
-                            setTimeout(() => location.reload(), 3000);
-                        }
-                    } else if (data.type === 'error') {
-                        showToast(data.error, 'error');
-                    }
-                } catch (e) {
-                    console.error('解析流数据失败:', e, line);
+                // 实时添加到详情列表
+                if (data.last_result) {
+                    resultsContainer.style.display = 'block';
+                    const res = data.last_result;
+                    const statusClass = res.success ? 'text-success' : 'text-danger';
+                    const statusText = res.success ? '成功' : '失败';
+                    const row = document.createElement('tr');
+                    row.innerHTML = `
+                        <td>${res.email}</td>
+                        <td class="${statusClass}">${statusText}</td>
+                        <td>${res.success ? (res.message || '导入成功') : res.error}</td>
+                    `;
+                    // 插入到最前面，方便看到最新的
+                    resultsBody.insertBefore(row, resultsBody.firstChild);
                 }
+            } else if (data.type === 'finish') {
+                receivedFinishEvent = true;
+                progressStage.textContent = '导入完成';
+                progressBar.style.width = '100%';
+                progressPercent.textContent = '100%';
+                finalSummaryEl.textContent = `总数: ${data.total} | 成功: ${data.success_count} | 失败: ${data.failed_count}`;
+
+                if (data.failed_count === 0) {
+                    showToast('全部导入成功！', 'success');
+                } else {
+                    showToast(`导入完成，成功 ${data.success_count} 条，失败 ${data.failed_count} 条`, 'warning');
+                }
+
+                // 刷新页面以显示新数据
+                if (data.success_count > 0) {
+                    setTimeout(() => location.reload(), 3000);
+                }
+            } else if (data.type === 'error') {
+                showToast(data.error, 'error');
             }
+        };
+
+        const processLine = (line) => {
+            if (!line.trim()) return;
+            try {
+                const data = JSON.parse(line);
+                applyBatchEvent(data);
+            } catch (e) {
+                console.error('解析流数据失败:', e, line);
+            }
+        };
+
+        if (response.body && typeof response.body.getReader === 'function') {
+            const reader = response.body.getReader();
+            const decoder = new TextDecoder();
+            let buffer = '';
+
+            while (true) {
+                const { value, done } = await reader.read();
+                if (done) break;
+
+                buffer += decoder.decode(value, { stream: true });
+                const lines = buffer.split('\n');
+                buffer = lines.pop(); // 最后一个可能是残缺的
+                lines.forEach(processLine);
+            }
+
+            // 处理最后可能残留的一行
+            if (buffer.trim()) {
+                processLine(buffer);
+            }
+        } else {
+            // 某些环境不支持可读流，退化为一次性解析
+            const text = await response.text();
+            text.split('\n').forEach(processLine);
+        }
+
+        // 流提前中断时，避免“已导入但前端显示失败”
+        if (receivedAnyEvent && !receivedFinishEvent && parseInt(successCountEl.textContent || '0', 10) > 0) {
+            showToast('导入连接中断，部分账号可能已导入，正在刷新页面确认', 'warning');
+            setTimeout(() => location.reload(), 1500);
         }
     } catch (error) {
-        showToast(error.message || '网络错误', 'error');
+        if (parseInt(successCountEl.textContent || '0', 10) > 0) {
+            showToast('导入连接中断，部分账号可能已导入，正在刷新页面确认', 'warning');
+            setTimeout(() => location.reload(), 1500);
+        } else {
+            showToast(error.message || '网络错误', 'error');
+        }
     } finally {
         submitButton.disabled = false;
         submitButton.textContent = '批量导入';

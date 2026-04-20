@@ -3,15 +3,20 @@
 处理管理员面板的所有页面和操作
 """
 import logging
+import asyncio
+import time
+import uuid
 from typing import Optional, List
 from fastapi import APIRouter, Depends, HTTPException, status, Request
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 import json
+from sqlalchemy import select, func
 from sqlalchemy.ext.asyncio import AsyncSession
 from pydantic import BaseModel, Field
 
-from app.database import get_db
+from app.database import get_db, AsyncSessionLocal
 from app.dependencies.auth import require_admin
+from app.models import Team
 from app.services.team import TeamService
 from app.services.redemption import RedemptionService
 from app.utils.time_utils import get_now
@@ -24,11 +29,160 @@ router = APIRouter(
     tags=["admin"]
 )
 
-import json
-
 # 服务实例
 team_service = TeamService()
 redemption_service = RedemptionService()
+
+_refresh_all_jobs = {}
+_refresh_all_jobs_lock = asyncio.Lock()
+_refresh_background_tasks: set = set()
+_max_refresh_all_job_history = 30
+
+
+async def _refresh_single_team_with_own_session(team_id: int) -> dict:
+    async with AsyncSessionLocal() as team_db:
+        try:
+            # 一键全量刷新以“同步状态”为主，不强制刷新 Token，避免可用 AT 被误判失败
+            refresh_result = await team_service.sync_team_info(team_id, team_db, force_refresh=False)
+            await team_db.commit()
+            return {
+                "team_id": team_id,
+                "success": bool(refresh_result.get("success")),
+                "message": refresh_result.get("message"),
+                "error": refresh_result.get("error"),
+            }
+        except Exception as ex:
+            logger.error(f"一键刷新 Team {team_id} 失败: {ex}")
+            await team_db.rollback()
+            return {
+                "team_id": team_id,
+                "success": False,
+                "message": None,
+                "error": str(ex),
+            }
+
+
+async def _count_active_teams() -> int:
+    async with AsyncSessionLocal() as count_db:
+        active_count_stmt = select(func.count()).select_from(Team).where(Team.status == "active")
+        active_result = await count_db.execute(active_count_stmt)
+        return active_result.scalar_one_or_none() or 0
+
+
+def _build_refresh_summary(total: int, success_count: int, failed_count: int, active_count: int) -> dict:
+    partial = success_count > 0 and failed_count > 0
+    overall_success = success_count > 0 and total > 0
+
+    if total == 0:
+        message = "当前没有可刷新的账号"
+    elif success_count == 0:
+        message = f"一键刷新执行完成，但全部失败: 失败 {failed_count}, 当前可用 {active_count}"
+    elif partial:
+        message = f"一键刷新部分成功: 成功 {success_count}, 失败 {failed_count}, 当前可用 {active_count}"
+    else:
+        message = f"一键刷新全部账号完成: 成功 {success_count}, 失败 {failed_count}, 当前可用 {active_count}"
+
+    return {
+        "success": overall_success,
+        "partial": partial,
+        "message": message,
+    }
+
+
+async def _run_refresh_all_job(job_id: str, team_ids: List[int]) -> None:
+    try:
+        total = len(team_ids)
+        if total == 0:
+            summary = _build_refresh_summary(total=0, success_count=0, failed_count=0, active_count=0)
+            async with _refresh_all_jobs_lock:
+                job = _refresh_all_jobs.get(job_id)
+                if job:
+                    job.update(
+                        {
+                            "status": "completed",
+                            "processed": 0,
+                            "success_count": 0,
+                            "failed_count": 0,
+                            "active_count": 0,
+                            "results": [],
+                            **summary,
+                        }
+                    )
+            return
+
+        concurrency_limit = 5
+        semaphore = asyncio.Semaphore(concurrency_limit)
+
+        async def _run_with_limit(team_id: int) -> dict:
+            async with semaphore:
+                return await _refresh_single_team_with_own_session(team_id)
+
+        tasks = [asyncio.create_task(_run_with_limit(team_id)) for team_id in team_ids]
+        results = []
+        success_count = 0
+        failed_count = 0
+
+        for finished in asyncio.as_completed(tasks):
+            item = await finished
+            results.append(item)
+            if item["success"]:
+                success_count += 1
+            else:
+                failed_count += 1
+
+            async with _refresh_all_jobs_lock:
+                job = _refresh_all_jobs.get(job_id)
+                if job:
+                    job["processed"] = len(results)
+                    job["success_count"] = success_count
+                    job["failed_count"] = failed_count
+
+        results.sort(key=lambda x: x["team_id"])
+        active_count = await _count_active_teams()
+        summary = _build_refresh_summary(
+            total=total,
+            success_count=success_count,
+            failed_count=failed_count,
+            active_count=active_count,
+        )
+
+        async with _refresh_all_jobs_lock:
+            job = _refresh_all_jobs.get(job_id)
+            if job:
+                job.update(
+                    {
+                        "status": "completed",
+                        "processed": total,
+                        "success_count": success_count,
+                        "failed_count": failed_count,
+                        "active_count": active_count,
+                        "results": results,
+                        **summary,
+                    }
+                )
+    except Exception as ex:
+        logger.error(f"刷新任务 {job_id} 执行失败: {ex}")
+        async with _refresh_all_jobs_lock:
+            job = _refresh_all_jobs.get(job_id)
+            if job:
+                job.update(
+                    {
+                        "status": "failed",
+                        "success": False,
+                        "partial": False,
+                        "error": str(ex),
+                        "message": f"一键刷新任务失败: {str(ex)}",
+                    }
+                )
+
+
+def _prune_refresh_jobs_locked() -> None:
+    if len(_refresh_all_jobs) <= _max_refresh_all_job_history:
+        return
+    overflow = len(_refresh_all_jobs) - _max_refresh_all_job_history
+    ordered = sorted(_refresh_all_jobs.items(), key=lambda kv: kv[1].get("created_ts", 0))
+    for job_id, _ in ordered[:overflow]:
+        _refresh_all_jobs.pop(job_id, None)
 
 
 # 请求模型
@@ -121,7 +275,7 @@ async def admin_dashboard(
             "total_teams": team_stats["total"],
             "available_teams": team_stats["available"],
             "total_codes": code_stats["total"],
-            "used_codes": code_stats["used"]
+            "used_codes": code_stats["used_total"]
         }
 
         return templates.TemplateResponse(
@@ -577,12 +731,14 @@ async def batch_refresh_teams(
                 # 注意: 这里使用 sync_team_info, 它会自动处理 Token 刷新和信息同步
                 # force_refresh=True 代表强制同步 API
                 result = await team_service.sync_team_info(team_id, db, force_refresh=True)
+                await db.commit()
                 if result.get("success"):
                     success_count += 1
                 else:
                     failed_count += 1
             except Exception as ex:
                 logger.error(f"批量刷新 Team {team_id} 时出错: {ex}")
+                await db.rollback()
                 failed_count += 1
         
         return JSONResponse(content={
@@ -597,6 +753,132 @@ async def batch_refresh_teams(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             content={"success": False, "error": str(e)}
         )
+
+
+@router.post("/teams/refresh-all")
+async def refresh_all_teams(
+    db: AsyncSession = Depends(get_db),
+    current_user: dict = Depends(require_admin)
+):
+    """
+    一键刷新所有 Team 管理员账号，并更新其可用状态。
+    """
+    try:
+        stmt = select(Team.id)
+        result = await db.execute(stmt)
+        team_ids = [row[0] for row in result.all()]
+
+        logger.info(f"管理员一键刷新全部 Team，共 {len(team_ids)} 个")
+
+        concurrency_limit = 5
+        semaphore = asyncio.Semaphore(concurrency_limit)
+
+        async def _run_with_limit(team_id: int) -> dict:
+            async with semaphore:
+                return await _refresh_single_team_with_own_session(team_id)
+
+        results = await asyncio.gather(*[_run_with_limit(team_id) for team_id in team_ids])
+
+        success_count = sum(1 for item in results if item["success"])
+        failed_count = len(results) - success_count
+
+        active_count = await _count_active_teams()
+        summary = _build_refresh_summary(
+            total=len(team_ids),
+            success_count=success_count,
+            failed_count=failed_count,
+            active_count=active_count,
+        )
+
+        return JSONResponse(content={
+            **summary,
+            "success_count": success_count,
+            "failed_count": failed_count,
+            "active_count": active_count,
+            "total": len(team_ids),
+            "results": results,
+        })
+    except Exception as e:
+        logger.error(f"一键刷新全部账号失败: {e}")
+        return JSONResponse(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            content={"success": False, "error": str(e)}
+        )
+
+
+@router.post("/teams/refresh-all/start")
+async def start_refresh_all_teams(
+    db: AsyncSession = Depends(get_db),
+    current_user: dict = Depends(require_admin)
+):
+    """
+    启动一键刷新后台任务，立即返回任务 ID，避免前端长请求超时。
+    """
+    try:
+        stmt = select(Team.id)
+        result = await db.execute(stmt)
+        team_ids = [row[0] for row in result.all()]
+
+        job_id = uuid.uuid4().hex
+        job_payload = {
+            "job_id": job_id,
+            "status": "running",
+            "success": False,
+            "partial": False,
+            "message": "一键刷新任务已启动",
+            "error": None,
+            "total": len(team_ids),
+            "processed": 0,
+            "success_count": 0,
+            "failed_count": 0,
+            "active_count": 0,
+            "results": [],
+            "created_ts": time.time(),
+        }
+
+        async with _refresh_all_jobs_lock:
+            _refresh_all_jobs[job_id] = job_payload
+            _prune_refresh_jobs_locked()
+
+        _t = asyncio.create_task(_run_refresh_all_job(job_id, team_ids))
+        _refresh_background_tasks.add(_t)
+        _t.add_done_callback(_refresh_background_tasks.discard)
+
+        return JSONResponse(
+            content={
+                "success": True,
+                "job_id": job_id,
+                "status": "running",
+                "total": len(team_ids),
+                "message": "一键刷新任务已启动，请稍候查看结果",
+            }
+        )
+    except Exception as e:
+        logger.error(f"启动一键刷新任务失败: {e}")
+        return JSONResponse(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            content={"success": False, "error": str(e)}
+        )
+
+
+@router.get("/teams/refresh-all/status/{job_id}")
+async def get_refresh_all_teams_status(
+    job_id: str,
+    current_user: dict = Depends(require_admin)
+):
+    """
+    查询一键刷新后台任务状态。
+    """
+    async with _refresh_all_jobs_lock:
+        job = _refresh_all_jobs.get(job_id)
+        if not job:
+            return JSONResponse(
+                status_code=status.HTTP_404_NOT_FOUND,
+                content={"success": False, "error": "刷新任务不存在或已过期"},
+            )
+        payload = dict(job)
+    payload.pop("created_ts", None)
+    return JSONResponse(content=payload)
 
 
 @router.post("/teams/batch-delete")

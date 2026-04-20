@@ -122,6 +122,10 @@
                 </div>
             </div>
 
+            <button onclick="refreshAllTeams()" class="btn btn-secondary">
+                <i data-lucide="refresh-cw" style="width: 16px; height: 16px;"></i> 一键刷新全部账号
+            </button>
+
             <button onclick="showModal('importTeamModal')" class="btn btn-primary">
                 <i data-lucide="plus-circle" style="width: 16px; height: 16px;"></i> 导入 Team
             </button>
@@ -482,7 +486,8 @@
         try {
             showToast('正在刷新...', 'info');
             const response = await fetch(`/api/teams/${teamId}/refresh?force=true`, {
-                method: 'GET'
+                method: 'GET',
+                credentials: 'same-origin'
             });
 
             const data = await response.json();
@@ -491,10 +496,11 @@
                 showToast('刷新成功', 'success');
                 setTimeout(() => location.reload(), 1000);
             } else {
-                showToast(data.error || '刷新失败', 'error');
+                const reason = data.error || data.detail || '刷新失败';
+                showToast(`[${response.status}] ${reason}`, 'error');
             }
         } catch (error) {
-            showToast('网络错误', 'error');
+            showToast(error.message || '网络错误', 'error');
         }
     }
 
@@ -509,7 +515,8 @@
         try {
             showToast('正在刷新...', 'info');
             const response = await fetch(`/api/teams/${teamId}/refresh?force=true`, {
-                method: 'GET'
+                method: 'GET',
+                credentials: 'same-origin'
             });
 
             const data = await response.json();
@@ -518,7 +525,9 @@
                 showToast('刷新成功', 'success');
 
                 // 刷新成功后，重新获取 Team 信息以更新模态框中的 AT
-                const infoResponse = await fetch(`/admin/teams/${teamId}/info`);
+                const infoResponse = await fetch(`/admin/teams/${teamId}/info`, {
+                    credentials: 'same-origin'
+                });
                 const infoData = await infoResponse.json();
 
                 if (infoResponse.ok && infoData.success) {
@@ -534,10 +543,11 @@
                     }
                 }
             } else {
-                showToast(data.error || '刷新失败', 'error');
+                const reason = data.error || data.detail || '刷新失败';
+                showToast(`[${response.status}] ${reason}`, 'error');
             }
         } catch (error) {
-            showToast('网络错误', 'error');
+            showToast(error.message || '网络错误', 'error');
         }
     }
 
@@ -789,6 +799,93 @@
 
     function handleBatchEnableDeviceAuth() {
         handleBatchAction('/admin/teams/batch-enable-device-auth', '批量开启验证');
+    }
+
+    async function refreshAllTeams() {
+        if (!confirm('确定要一键刷新所有 Team 管理员账号吗？')) {
+            return;
+        }
+
+        const parseResponseData = async (response) => {
+            const raw = await response.text();
+            try {
+                return { data: JSON.parse(raw), raw };
+            } catch (e) {
+                return { data: null, raw };
+            }
+        };
+
+        const pollRefreshJob = async (jobId, maxRounds = 240, intervalMs = 1500) => {
+            for (let i = 0; i < maxRounds; i++) {
+                await new Promise(resolve => setTimeout(resolve, intervalMs));
+                const statusResp = await fetch(`/admin/teams/refresh-all/status/${encodeURIComponent(jobId)}`, {
+                    method: 'GET',
+                    credentials: 'same-origin',
+                    headers: { 'Accept': 'application/json' }
+                });
+                const { data: statusResult, raw } = await parseResponseData(statusResp);
+
+                if (!statusResp.ok) {
+                    const reason = (statusResult && (statusResult.error || statusResult.detail)) || raw || `状态查询失败(${statusResp.status})`;
+                    throw new Error(reason);
+                }
+                if (!statusResult) {
+                    throw new Error('状态响应不是有效 JSON');
+                }
+
+                if (statusResult.status === 'completed') {
+                    return statusResult;
+                }
+                if (statusResult.status === 'failed') {
+                    throw new Error(statusResult.error || statusResult.message || '一键刷新任务失败');
+                }
+            }
+            throw new Error('一键刷新执行时间过长，请稍后刷新页面查看最新状态');
+        };
+
+        try {
+            showToast('正在一键刷新全部账号...', 'info');
+            const response = await fetch('/admin/teams/refresh-all/start', {
+                method: 'POST',
+                credentials: 'same-origin',
+                headers: {
+                    'Content-Type': 'application/json'
+                }
+            });
+            const { data: startResult, raw } = await parseResponseData(response);
+
+            if (!response.ok) {
+                const reason = (startResult && (startResult.error || startResult.detail)) || raw || '一键刷新启动失败';
+                throw new Error(`[${response.status}] ${reason}`);
+            }
+
+            const jobId = startResult && startResult.job_id;
+            if (!jobId) {
+                throw new Error('一键刷新未返回任务 ID');
+            }
+
+            const result = await pollRefreshJob(jobId);
+
+            // 收集失败账号的具体错误
+            const failedDetails = (result.results || [])
+                .filter(r => !r.success && r.error)
+                .map(r => `Team ${r.team_id}: ${r.error}`)
+                .join('\n');
+
+            if (result.success && !result.partial) {
+                showToast(result.message || '一键刷新成功', 'success');
+            } else if (result.success && result.partial) {
+                const msg = result.message || '一键刷新部分成功';
+                showToast(failedDetails ? `${msg}\n\n失败原因:\n${failedDetails}` : msg, 'info');
+            } else {
+                const msg = result.message || result.error || '一键刷新失败';
+                showToast(failedDetails ? `${msg}\n\n失败原因:\n${failedDetails}` : msg, 'error');
+            }
+            setTimeout(() => location.reload(), 1500);
+        } catch (error) {
+            console.error(error);
+            showToast(error.message || '请求失败，请稍后重试', 'error');
+        }
     }
 
     function changePerPage(val) {

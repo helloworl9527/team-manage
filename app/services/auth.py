@@ -65,18 +65,10 @@ class AuthService:
         Returns:
             密码哈希，如果不存在则返回 None
         """
-        try:
-            stmt = select(Setting).where(Setting.key == "admin_password_hash")
-            result = await db_session.execute(stmt)
-            setting = result.scalar_one_or_none()
-
-            if setting:
-                return setting.value
-            return None
-
-        except Exception as e:
-            logger.error(f"获取管理员密码哈希失败: {e}")
-            return None
+        stmt = select(Setting).where(Setting.key == "admin_password_hash")
+        result = await db_session.execute(stmt)
+        setting = result.scalar_one_or_none()
+        return setting.value if setting else None
 
     async def set_admin_password_hash(
         self,

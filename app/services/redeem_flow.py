@@ -27,6 +27,22 @@ _code_locks = defaultdict(asyncio.Lock)
 _team_locks = defaultdict(asyncio.Lock)
 
 
+_background_tasks: set = set()
+
+
+def _schedule_background_task(coro):
+    """
+    在正常运行环境下注册后台任务；在测试里若 create_task 被替换为 None，安全降级跳过。
+    """
+    task = asyncio.create_task(coro)
+    if task is None:
+        return None
+    _background_tasks.add(task)
+    if hasattr(task, "add_done_callback"):
+        task.add_done_callback(_background_tasks.discard)
+    return task
+
+
 class RedeemFlowService:
     """兑换流程场景服务类"""
 
@@ -122,7 +138,7 @@ class RedeemFlowService:
             stmt = select(Team).where(Team.status == "active")
             
             if exclude_team_ids:
-                stmt = stmt.where(Team.id.not_in(exclude_team_ids))
+                stmt = stmt.where(~Team.id.in_(exclude_team_ids))
 
             result = await db_session.execute(stmt)
             teams = [team for team in result.scalars().all() if self.team_service._remaining_slots(team) > 0]
@@ -162,6 +178,154 @@ class RedeemFlowService:
                 "error": f"自动选择 Team 失败: {str(e)}"
             }
 
+    async def _resolve_warranty_expires_at(
+        self,
+        db_session: AsyncSession,
+        redemption_code: RedemptionCode
+    ) -> Optional[datetime]:
+        """
+        计算/获取质保到期时间（用于重兑自动选 Team 和返回展示）。
+        """
+        if not redemption_code.has_warranty:
+            return None
+
+        if redemption_code.warranty_expires_at:
+            return redemption_code.warranty_expires_at
+
+        stmt = select(func.min(RedemptionRecord.redeemed_at)).where(
+            RedemptionRecord.code == redemption_code.code
+        )
+        result = await db_session.execute(stmt)
+        first_redeemed_at = result.scalar_one_or_none() or redemption_code.used_at
+        if not first_redeemed_at:
+            return None
+
+        return first_redeemed_at + timedelta(days=redemption_code.warranty_days or 30)
+
+    async def _select_team_for_warranty(
+        self,
+        db_session: AsyncSession,
+        warranty_expires_at: datetime,
+        exclude_team_ids: Optional[List[int]] = None
+    ) -> Dict[str, Any]:
+        """
+        质保自动选 Team（首次兑换与重兑共用）：
+        1) 优先选取 expires_at >= warranty_expires_at 且正差值最小的可用 Team。
+        2) 若不存在，则回退为 expires_at 与 warranty_expires_at 最接近的可用 Team（同差值优先更晚到期）。
+        """
+        stmt = select(Team).where(Team.status == "active")
+        if exclude_team_ids:
+            stmt = stmt.where(~Team.id.in_(exclude_team_ids))
+
+        result = await db_session.execute(stmt)
+        teams = [team for team in result.scalars().all() if self.team_service._remaining_slots(team) > 0]
+
+        # 单趟扫描：同时计算"严格优先候选"和"回退最近候选"，避免多次构造中间列表。
+        best_after_team = None
+        best_after_key = None
+        best_closest_team = None
+        best_closest_key = None
+
+        for team in teams:
+            if not team.expires_at:
+                continue
+
+            created_ts = team.created_at.timestamp() if team.created_at else 0
+            occupied_slots = self.team_service._occupied_slots(team)
+
+            if team.expires_at >= warranty_expires_at:
+                after_key = (
+                    (team.expires_at - warranty_expires_at).total_seconds(),
+                    occupied_slots,
+                    -created_ts,
+                )
+                if best_after_key is None or after_key < best_after_key:
+                    best_after_key = after_key
+                    best_after_team = team
+
+            closest_key = (
+                abs((team.expires_at - warranty_expires_at).total_seconds()),
+                -team.expires_at.timestamp(),
+                occupied_slots,
+                -created_ts,
+            )
+            if best_closest_key is None or closest_key < best_closest_key:
+                best_closest_key = closest_key
+                best_closest_team = team
+
+        if best_after_team:
+            logger.info(
+                "质保自动选 Team(严格优先): code_expiry=%s, selected_team=%s, team_expiry=%s",
+                warranty_expires_at.isoformat(),
+                best_after_team.id,
+                best_after_team.expires_at.isoformat(),
+            )
+            return {"success": True, "team_id": best_after_team.id, "error": None}
+
+        if best_closest_team:
+            logger.info(
+                "质保自动选 Team(回退最近): code_expiry=%s, selected_team=%s, team_expiry=%s",
+                warranty_expires_at.isoformat(),
+                best_closest_team.id,
+                best_closest_team.expires_at.isoformat(),
+            )
+            return {"success": True, "team_id": best_closest_team.id, "error": None}
+
+        return {
+            "success": False,
+            "team_id": None,
+            "error": "暂无可用 Team（无法匹配质保重兑条件）"
+        }
+
+    async def _auto_select_team_for_redemption(
+        self,
+        db_session: AsyncSession,
+        code: str,
+        email: str,
+        exclude_team_ids: Optional[List[int]] = None,
+    ) -> Dict[str, Any]:
+        """
+        根据兑换上下文自动选 Team。
+        - 有质保的兑换码（首次或重兑）：优先按 Team 到期 >= 质保到期且最接近 选取，
+          若无满足条件者，回退为最接近质保到期的 Team。
+        - 无质保常规兑换：沿用默认负载均衡选取。
+        """
+        stmt = select(RedemptionCode).where(RedemptionCode.code == code)
+        result = await db_session.execute(stmt)
+        redemption_code = result.scalar_one_or_none()
+        if not redemption_code:
+            return {"success": False, "team_id": None, "error": "兑换码不存在"}
+
+        if redemption_code.has_warranty and redemption_code.status == "used":
+            warranty_check = await self.warranty_service.validate_warranty_reuse(db_session, code, email)
+            if not warranty_check.get("can_reuse"):
+                return {
+                    "success": False,
+                    "team_id": None,
+                    "error": warranty_check.get("reason") or "质保不可重兑",
+                }
+
+            warranty_expires_at = await self._resolve_warranty_expires_at(db_session, redemption_code)
+            if not warranty_expires_at:
+                return {"success": False, "team_id": None, "error": "无法计算质保到期时间，暂不可自动分配 Team"}
+
+            return await self._select_team_for_warranty(
+                db_session=db_session,
+                warranty_expires_at=warranty_expires_at,
+                exclude_team_ids=exclude_team_ids,
+            )
+
+        # 首次兑换有质保码：也按质保到期时间选 Team
+        if redemption_code.has_warranty and redemption_code.warranty_days:
+            warranty_expires_at = get_now() + timedelta(days=redemption_code.warranty_days)
+            return await self._select_team_for_warranty(
+                db_session=db_session,
+                warranty_expires_at=warranty_expires_at,
+                exclude_team_ids=exclude_team_ids,
+            )
+
+        return await self.select_team_auto(db_session=db_session, exclude_team_ids=exclude_team_ids)
+
     async def redeem_and_join_team(
         self,
         email: str,
@@ -178,6 +342,7 @@ class RedeemFlowService:
         core_success = False
         success_result = None
         team_id_final = None
+        tried_team_ids: List[int] = []
 
         # 针对 code 加锁，防止同一个码并发进入兑换
         async with _code_locks[code]:
@@ -188,11 +353,18 @@ class RedeemFlowService:
                     # 确定目标 Team (初选)
                     team_id_final = current_target_team_id
                     if not team_id_final:
-                        select_res = await self.select_team_auto(db_session)
+                        select_res = await self._auto_select_team_for_redemption(
+                            db_session=db_session,
+                            code=code,
+                            email=email,
+                            exclude_team_ids=tried_team_ids
+                        )
                         if not select_res["success"]:
                             return {"success": False, "error": select_res["error"]}
                         team_id_final = select_res["team_id"]
                         current_target_team_id = team_id_final
+                    if team_id_final not in tried_team_ids:
+                        tried_team_ids.append(team_id_final)
                     
                     # 使用 Team 锁序列化对该账户的操作，防止并发冲突
                     async with _team_locks[team_id_final]:
@@ -258,7 +430,9 @@ class RedeemFlowService:
                         # 必须重新加载 target_team
                         res = await db_session.execute(select(Team).where(Team.id == team_id_final))
                         target_team = res.scalar_one_or_none()
-                        
+                        if not target_team:
+                            raise Exception(f"Team {team_id_final} 不存在或已被删除")
+
                         access_token = await self.team_service.ensure_access_token(target_team, db_session)
                         if not access_token:
                             raise Exception("获取 Team 访问权限失败，账户状态异常")
@@ -309,6 +483,7 @@ class RedeemFlowService:
                                 if rc.has_warranty:
                                     days = rc.warranty_days or 30
                                     rc.warranty_expires_at = redemption_time + timedelta(days=days)
+                            effective_warranty_expires_at = await self._resolve_warranty_expires_at(db_session, rc)
 
                             record = RedemptionRecord(
                                 email=email,
@@ -333,7 +508,9 @@ class RedeemFlowService:
                                     "id": team_id_final,
                                     "team_name": target_team.team_name,
                                     "email": target_team.email,
-                                    "expires_at": target_team.expires_at.isoformat() if target_team.expires_at else None
+                                    "expires_at": target_team.expires_at.isoformat() if target_team.expires_at else None,
+                                    "warranty_expires_at": effective_warranty_expires_at.isoformat() if effective_warranty_expires_at else None,
+                                    "redeemed_at": redemption_time.isoformat(),
                                 }
                             }
                             core_success = True
@@ -360,7 +537,7 @@ class RedeemFlowService:
                     if any(kw in last_error for kw in ["不存在", "已使用", "已有正在使用", "质保已过期"]):
                         return {"success": False, "error": last_error}
 
-                    # 判定是否需要永久标记为“满员”
+                    # 判定是否需要永久标记为"满员"
                     if any(kw in last_error.lower() for kw in ["已满", "seats", "full"]):
                         try:
                             if not team_id:
@@ -379,10 +556,10 @@ class RedeemFlowService:
             
             if core_success:
                 # 后台异步验证任务 (循环检测 3 次，确保 API 数据同步) - 移至后台以极大提高并发并防止 HTTP 超时
-                asyncio.create_task(self._background_verify_sync(team_id_final, email))
-                
+                _schedule_background_task(self._background_verify_sync(team_id_final, email))
+
                 # 补货通知任务 (异步)
-                asyncio.create_task(notification_service.check_and_notify_low_stock())
+                _schedule_background_task(notification_service.check_and_notify_low_stock())
                     
                 return success_result
             else:
@@ -412,7 +589,7 @@ class RedeemFlowService:
                         logger.warning(f"Team {team_id} [Background] 尚未见到成员 {email}，准备第 {i+2} 次重试...")
                 
                 if not is_verified:
-                    logger.error(f"检测到“虚假成功”: Team {team_id} 兑换成功但 15s 后仍查不到成员 {email}")
+                    logger.error(f"检测到'虚假成功': Team {team_id} 兑换成功但 15s 后仍查不到成员 {email}")
                     # 在后台标记异常
                     stmt = select(Team).where(Team.id == team_id)
                     t_res = await db_session.execute(stmt)

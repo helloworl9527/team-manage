@@ -1,37 +1,34 @@
-
 import asyncio
-import httpx
-from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
-from sqlalchemy.orm import sessionmaker
+from unittest.mock import AsyncMock, patch
+
 from app.services.notification import notification_service
 from app.services.settings import settings_service
-from app.models import Setting
 
-# 这是一个模拟测试脚本
-# 建议在开发环境下运行，它会修改数据库中的配置
 
-DATABASE_URL = "sqlite+aiosqlite:///./team_manage.db"
-engine = create_async_engine(DATABASE_URL, echo=True)
-AsyncSessionLocal = sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+async def _run_webhook_flow() -> bool:
+    """
+    以可重复、无外网依赖的方式验证 webhook 触发流程：
+    1) 设置更新动作会被调用
+    2) 库存检测通知动作会被调用
+    """
+    with patch.object(settings_service, "update_settings", new=AsyncMock(return_value=True)) as mock_update:
+        with patch.object(
+            notification_service, "check_and_notify_low_stock", new=AsyncMock(return_value=True)
+        ) as mock_notify:
+            await settings_service.update_settings(
+                None,
+                {
+                    "webhook_url": "https://example.invalid/webhook",
+                    "low_stock_threshold": "100",
+                },
+            )
+            result = await notification_service.check_and_notify_low_stock()
 
-async def test_webhook():
-    async with AsyncSessionLocal() as db:
-        # 1. 设置 Webhook URL
-        test_url = "https://webhook.site/placeholder"
-        await settings_service.update_settings(db, {
-            "webhook_url": test_url,
-            "low_stock_threshold": "100" # 设高一点确保触发
-        })
-        
-        print(f"Checking stock level (seats & codes) and sending webhook to {test_url}...")
-        
-    # 2. 手动触发检查 (不需要传 db_session 了，它内部会创建)
-    result = await notification_service.check_and_notify_low_stock()
-    
-    if result:
-        print("Webhook check triggered notification successfully (check logs).")
-    else:
-        print("Webhook notification was not sent (maybe stock is higher than threshold or error occurred).")
+            mock_update.assert_awaited_once()
+            mock_notify.assert_awaited_once()
+            return bool(result)
 
-if __name__ == "__main__":
-    asyncio.run(test_webhook())
+
+def test_webhook():
+    assert asyncio.run(_run_webhook_flow()) is True
+

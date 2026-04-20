@@ -52,7 +52,7 @@ class TeamService:
         error_code = result.get("error_code")
         error_msg = str(result.get("error", "")).lower()
         
-        # 1. 判定是否为“封号/永久失效”类致命错误
+        # 1. 判定是否为"封号/永久失效"类致命错误
         # 明确的错误码匹配
         ban_codes = {
             "account_deactivated", 
@@ -82,9 +82,9 @@ class TeamService:
             if any(kw in error_msg for kw in ban_keywords):
                 is_banned = True
                 
-        # 1.1 判定是否为“虚假成功” (Ghost Success)
+        # 1.1 判定是否为"虚假成功" (Ghost Success)
         if error_code == "ghost_success":
-            logger.error(f"检测到 Team {team.id} ({team.email}) 存在“虚假成功”现象 (邀请返回 200 但列表无成员)，标记为 error")
+            logger.error(f"检测到 Team {team.id} ({team.email}) 存在'虚假成功'现象 (邀请返回 200 但列表无成员)，标记为 error")
             team.status = "error"
             if not db_session.in_transaction():
                 await db_session.commit()
@@ -105,22 +105,22 @@ class TeamService:
                 await db_session.commit()
             return True
 
-        # 2. 判定是否为“席位已满”错误
+        # 2. 判定是否为"席位已满"错误
         full_keywords = ["maximum number of seats", "reached maximum number of seats", "no seats available"]
         if any(kw in error_msg for kw in full_keywords):
             logger.warning(f"检测到 Team 席位已满 (msg={error_msg}), 更新 Team {team.id} ({team.email}) 状态为 full")
             team.status = "full"
-            occupied_slots = self._occupied_slots(team)
-            # 学习真实的席位上限: 如果当前探测到的成员数小于预设的最大值，说明该团队实际容量较小
-            if occupied_slots > 0 and occupied_slots < team.max_members:
-                logger.info(f"修正 Team {team.id} 的最大成员数: {team.max_members} -> {occupied_slots}")
-                team.max_members = occupied_slots
+            # 只用已确认的真实成员数（不含 pending）来修正上限，避免把 pending 计入
+            confirmed_members = team.current_members or 0
+            if confirmed_members > 0 and confirmed_members < team.max_members:
+                logger.info(f"修正 Team {team.id} 的最大成员数: {team.max_members} -> {confirmed_members}")
+                team.max_members = confirmed_members
 
             if not db_session.in_transaction():
                 await db_session.commit()
             return True
 
-        # 2.5 判定是否为“已在团队中” (这通常被视为成功的变种)
+        # 2.5 判定是否为"已在团队中" (这通常被视为成功的变种)
         already_in_keywords = ["already in workspace", "already in team", "already a member"]
         if any(kw in error_msg for kw in already_in_keywords):
             logger.info(f"Team {team.id} 提示用户已在团队中: {error_msg}")
@@ -164,7 +164,7 @@ class TeamService:
             if self._occupied_slots(team) >= team.max_members:
                 logger.info(f"Team {team.id} ({team.email}) 请求成功, 将状态从 error 恢复为 full")
                 team.status = "full"
-            elif team.expires_at and team.expires_at < datetime.now():
+            elif team.expires_at and team.expires_at < get_now():
                 logger.info(f"Team {team.id} ({team.email}) 请求成功, 将状态从 error 恢复为 expired")
                 team.status = "expired"
             else:
@@ -336,7 +336,16 @@ class TeamService:
                         "message": None,
                         "error": "无法从 Token 中提取邮箱,请手动提供邮箱"
                     }
-            elif token_email and token_email.lower() != email.lower():
+            elif not token_email:
+                # token 解析失败，无法校验身份，拒绝导入以防止身份污染
+                return {
+                    "success": False,
+                    "team_id": None,
+                    "email": email,
+                    "message": None,
+                    "error": "无法从 Token 中解析邮箱地址，无法验证身份一致性，导入已中止"
+                }
+            elif token_email.lower() != email.lower():
                 logger.error(f"导入时 Token 邮箱不匹配: 预期 {email}, 实际 {token_email}")
                 return {
                     "success": False,
@@ -417,6 +426,7 @@ class TeamService:
             # 4. 循环处理这些账户
             imported_ids = []
             skipped_ids = []
+            skipped_team_ids = []
             
             for selected_account in accounts_to_import:
                 # 检查是否已存在 (根据 account_id)
@@ -428,6 +438,7 @@ class TeamService:
 
                 if existing_team:
                     skipped_ids.append(selected_account["account_id"])
+                    skipped_team_ids.append(existing_team.id)
                     continue
 
                 # 获取成员列表 (包含已加入和待加入)
@@ -451,14 +462,19 @@ class TeamService:
                     pending_invites = invites_result["total"]
                 occupied_slots = current_members + pending_invites
 
-                # 解析过期时间
+                # 解析过期时间（API 返回 UTC ISO 8601，转为与 get_now() 同语义的 naive 本地时间）
                 expires_at = None
                 if selected_account["expires_at"]:
                     try:
-                        # ISO 8601 格式: 2026-02-21T23:10:05+00:00
-                        expires_at = datetime.fromisoformat(
-                            selected_account["expires_at"].replace("+00:00", "")
-                        )
+                        from datetime import timezone as _tz
+                        dt_utc = datetime.fromisoformat(selected_account["expires_at"].replace("Z", "+00:00"))
+                        if dt_utc.tzinfo is not None:
+                            import pytz as _pytz
+                            from app.config import settings as _settings
+                            local_tz = _pytz.timezone(_settings.timezone)
+                            expires_at = dt_utc.astimezone(local_tz).replace(tzinfo=None)
+                        else:
+                            expires_at = dt_utc
                     except Exception as e:
                         logger.warning(f"解析过期时间失败: {e}")
 
@@ -479,7 +495,7 @@ class TeamService:
                 status = "active"
                 if occupied_slots >= max_members:
                     status = "full"
-                elif expires_at and expires_at < datetime.now():
+                elif expires_at and expires_at < get_now():
                     status = "expired"
 
                 # 加密 AT Token
@@ -527,11 +543,11 @@ class TeamService:
             # 5. 返回结果总结
             if not imported_ids and skipped_ids:
                 return {
-                    "success": False,
-                    "team_id": None,
+                    "success": True,
+                    "team_id": skipped_team_ids[0] if skipped_team_ids else None,
                     "email": email,
-                    "message": None,
-                    "error": f"共发现 {len(skipped_ids)} 个 Team 账号,但均已在系统中"
+                    "message": f"共发现 {len(skipped_ids)} 个 Team 账号，均已在系统中，已跳过重复导入",
+                    "error": None
                 }
             
             if not imported_ids:
@@ -653,7 +669,7 @@ class TeamService:
             if team.status in ["active", "full", "expired"]:
                 if self._occupied_slots(team) >= team.max_members:
                     team.status = "full"
-                elif team.expires_at and team.expires_at < datetime.now():
+                elif team.expires_at and team.expires_at < get_now():
                     team.status = "expired"
                 else:
                     team.status = "active"
@@ -1522,7 +1538,7 @@ class TeamService:
                     logger.warning(f"Team {team_id} [add_member] 尚未见到成员 {email}，准备第 {i+2} 次重试...")
             
             if not is_verified:
-                logger.error(f"检测到“虚假成功”: Team {team_id} 发送邀请返回成功，但经过 3 次同步校验均未见该邮箱 {email}")
+                logger.error(f"检测到'虚假成功': Team {team_id} 发送邀请返回成功，但经过 3 次同步校验均未见该邮箱 {email}")
                 # 标记错误
                 await self._handle_api_error({"success": False, "error": "邀请发送成功但同步列表未见成员", "error_code": "ghost_success"}, team, db_session)
                 return {

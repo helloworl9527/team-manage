@@ -131,6 +131,7 @@ class WarrantyService:
                             "warranty_valid": True if not redemption_code_obj.warranty_expires_at or redemption_code_obj.warranty_expires_at > get_now() else False,
                             "status": redemption_code_obj.status,
                             "used_at": None,
+                            "redeemed_at": None,
                             "team_id": None,
                             "team_name": None,
                             "team_status": None,
@@ -178,7 +179,7 @@ class WarrantyService:
 
             # 2. 处理记录并进行必要的实时同步
             final_records = []
-            banned_teams_info = []
+            invalid_teams_info = []
             has_any_warranty = False
             primary_warranty_valid = False
             primary_expiry = None
@@ -213,7 +214,7 @@ class WarrantyService:
                         expiry_date = start_time + timedelta(days=days)
 
                 is_valid = True
-                if expiry_date and expiry_date < get_now():
+                if expiry_date and expiry_date <= get_now():
                     is_valid = False
                 elif not expiry_date and code_obj.has_warranty and code_obj.status == "unused":
                     # 未使用的质保码，暂时标记为有效
@@ -230,12 +231,14 @@ class WarrantyService:
                         primary_expiry = expiry_date
                         primary_code = code_obj.code
 
-                # 记录封号 Team
-                if team.status == "banned":
-                    banned_teams_info.append({
+                # 记录失效 Team（封禁或过期）以决定是否允许质保重兑
+                team_is_expired = bool(team.expires_at and team.expires_at < get_now())
+                if team.status in ["banned", "expired"] or team_is_expired:
+                    invalid_teams_info.append({
                         "team_id": team.id,
                         "team_name": team.team_name,
                         "email": team.email,
+                        "invalid_reason": "banned" if team.status == "banned" else "expired",
                         "banned_at": team.last_sync.isoformat() if team.last_sync else None
                     })
 
@@ -246,6 +249,7 @@ class WarrantyService:
                     "warranty_expires_at": expiry_date.isoformat() if expiry_date else None,
                     "status": code_obj.status,
                     "used_at": record.redeemed_at.isoformat() if record.redeemed_at else None,
+                    "redeemed_at": record.redeemed_at.isoformat() if record.redeemed_at else None,
                     "team_id": team.id,
                     "team_name": team.team_name,
                     "team_status": team.status,
@@ -254,8 +258,8 @@ class WarrantyService:
                     "device_code_auth_enabled": team.device_code_auth_enabled
                 })
 
-            # 3. 判断是否可以重复使用 (只要有有效的质保码且有被封的 Team)
-            if has_any_warranty and primary_warranty_valid and len(banned_teams_info) > 0:
+            # 3. 判断是否可以重复使用 (有效质保 + 失效 Team)
+            if has_any_warranty and primary_warranty_valid and len(invalid_teams_info) > 0:
                 # 进一步验证 (使用现有的 validate_warranty_reuse 逻辑)
                 # 这里为了简单直接复用逻辑判断
                 can_reuse = True
@@ -272,7 +276,7 @@ class WarrantyService:
                 "has_warranty": has_any_warranty,
                 "warranty_valid": primary_warranty_valid,
                 "warranty_expires_at": primary_expiry.isoformat() if primary_expiry else None,
-                "banned_teams": banned_teams_info,
+                "banned_teams": invalid_teams_info,
                 "can_reuse": can_reuse,
                 "original_code": primary_code,
                 "records": final_records,
@@ -328,7 +332,7 @@ class WarrantyService:
 
             # 3. 检查质保期是否有效
             if redemption_code.warranty_expires_at:
-                if redemption_code.warranty_expires_at < get_now():
+                if redemption_code.warranty_expires_at <= get_now():
                     return {
                         "success": True,
                         "can_reuse": False,
@@ -418,27 +422,29 @@ class WarrantyService:
                             "error": None
                         }
 
-            # 6. 检查是否有过被封的记录
-            has_banned_team = False
+            # 6. 检查是否有过失效记录（封禁/过期）
+            has_invalid_team = False
             for record in records:
                 stmt = select(Team).where(Team.id == record.team_id)
                 result = await db_session.execute(stmt)
                 team = result.scalar_one_or_none()
-                if team and team.status == "banned":
-                    has_banned_team = True
-                    break
-            if has_banned_team:
+                if team:
+                    team_is_expired = bool(team.expires_at and team.expires_at < get_now())
+                    if team.status in ["banned", "expired"] or team_is_expired:
+                        has_invalid_team = True
+                        break
+            if has_invalid_team:
                 return {
                     "success": True,
                     "can_reuse": True,
-                    "reason": "之前加入的 Team 已封号，可使用质保重复兑换",
+                    "reason": "之前加入的 Team 已封禁或过期，可使用质保重复兑换",
                     "error": None
                 }
             else:
                 return {
                     "success": True,
                     "can_reuse": False,
-                    "reason": "未找到被封号记录，且质保不支持正常过期或异常提示的重复兑换",
+                    "reason": "未找到封禁/过期记录，当前不可重复兑换",
                     "error": None
                 }
 

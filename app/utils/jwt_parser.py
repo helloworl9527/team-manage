@@ -114,7 +114,9 @@ class JWTParser:
         try:
             exp_timestamp = payload.get("exp")
             if exp_timestamp:
-                return datetime.fromtimestamp(exp_timestamp)
+                # JWT exp 是 UTC Unix 时间戳，转为 naive UTC datetime 后与 get_now()（本地时区 naive）对比
+                from datetime import timezone
+                return datetime.fromtimestamp(exp_timestamp, tz=timezone.utc).replace(tzinfo=None)
             return None
         except Exception as e:
             logger.error(f"获取过期时间失败: {e}")
@@ -131,8 +133,9 @@ class JWTParser:
             True 表示已过期,False 表示未过期
         """
         exp_time = self.get_expiration_time(token)
-        if not exp_time:
-            return True  # 无法获取过期时间,视为已过期
+        if exp_time is None:
+            logger.warning("无法获取 Token 过期时间，保守视为未过期")
+            return False
 
         return get_now() > exp_time
 

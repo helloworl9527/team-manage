@@ -30,6 +30,7 @@ class WarrantyCheckRecord(BaseModel):
     warranty_expires_at: Optional[str]
     status: str
     used_at: Optional[str]
+    redeemed_at: Optional[str] = None
     team_id: Optional[int]
     team_name: Optional[str]
     team_status: Optional[str]

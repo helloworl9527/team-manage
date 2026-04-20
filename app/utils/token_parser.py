@@ -92,6 +92,9 @@ class TokenParser:
         """
         results = []
 
+        if not text:
+            return results
+
         # 按行分割文本
         lines = text.strip().split('\n')
 

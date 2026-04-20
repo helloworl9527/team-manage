@@ -48,14 +48,17 @@ async def refresh_team(
         result = await team_service.sync_team_info(team_id, db, force_refresh=force)
 
         if not result["success"]:
+            await db.rollback()
             return JSONResponse(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 content=result
             )
 
+        await db.commit()
         return JSONResponse(content=result)
 
     except Exception as e:
+        await db.rollback()
         logger.error(f"刷新 Team 失败: {e}")
         return JSONResponse(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,

@@ -105,7 +105,7 @@ class RedemptionService:
 
             # 2. 计算过期时间
             expires_at = None
-            if expires_days:
+            if expires_days is not None and expires_days > 0:
                 expires_at = get_now() + timedelta(days=expires_days)
 
             # 3. 创建兑换码记录
@@ -360,6 +360,13 @@ class RedemptionService:
             result = await db_session.execute(stmt)
             redemption_code = result.scalar_one_or_none()
 
+            if not redemption_code:
+                return {
+                    "success": False,
+                    "message": None,
+                    "error": "兑换码不存在或已被删除"
+                }
+
             redemption_code.status = "used"
             redemption_code.used_by_email = email
             redemption_code.used_team_id = team_id
@@ -449,6 +456,7 @@ class RedemptionService:
                 page = 1
             if page > total_pages and total_pages > 0:
                 page = total_pages
+                logger.warning(f"请求页码超出范围，已返回最后一页 ({page})")
             
             offset = (page - 1) * per_page
 
@@ -637,7 +645,7 @@ class RedemptionService:
                 filters.append(RedemptionRecord.email.ilike(f"%{email}%"))
             if code:
                 filters.append(RedemptionRecord.code.ilike(f"%{code}%"))
-            if team_id:
+            if team_id is not None:
                 filters.append(RedemptionRecord.team_id == team_id)
                 
             if filters:
@@ -706,6 +714,10 @@ class RedemptionService:
                     "error": f"兑换码 {code} 不存在"
                 }
 
+            # 先删除关联的兑换记录，防止外键约束错误或留下孤儿记录
+            await db_session.execute(
+                delete(RedemptionRecord).where(RedemptionRecord.code == code)
+            )
             # 删除兑换码
             await db_session.delete(redemption_code)
             await db_session.commit()
@@ -791,9 +803,16 @@ class RedemptionService:
                 code.used_by_email = None
                 code.used_team_id = None
                 code.used_at = None
-                # 特殊处理质保字段
+                # 质保字段：只有在没有其他兑换记录时才清除，否则保留质保期语义
                 if code.has_warranty:
-                    code.warranty_expires_at = None
+                    other_records_stmt = select(RedemptionRecord).where(
+                        RedemptionRecord.code == code.code,
+                        RedemptionRecord.id != record_id
+                    )
+                    other_records_result = await db_session.execute(other_records_stmt)
+                    has_other_records = other_records_result.scalar_one_or_none() is not None
+                    if not has_other_records:
+                        code.warranty_expires_at = None
 
             # 4. 删除使用记录
             await db_session.delete(record)
@@ -887,20 +906,20 @@ class RedemptionService:
             result = await db_session.execute(stmt)
             status_counts = dict(result.all())
             
-            # 由于 "used" 和 "warranty_active" 都属于广义上的 "已使用"
-            # 这里的 used 统计需要合并这两个状态
-            used_count = status_counts.get("used", 0) + status_counts.get("warranty_active", 0)
-            
+            used_strict = status_counts.get("used", 0)
+            warranty_active = status_counts.get("warranty_active", 0)
+
             # 计算总数
             total_stmt = select(func.count(RedemptionCode.id))
             total_result = await db_session.execute(total_stmt)
             total = total_result.scalar() or 0
-            
+
             return {
                 "total": total,
                 "unused": status_counts.get("unused", 0),
-                "used": used_count,
-                "warranty_active": status_counts.get("warranty_active", 0),
+                "used": used_strict,
+                "warranty_active": warranty_active,
+                "used_total": used_strict + warranty_active,
                 "expired": status_counts.get("expired", 0)
             }
         except Exception as e:

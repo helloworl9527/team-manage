@@ -216,6 +216,8 @@ async function confirmRedeem(teamId) {
 function showSuccessResult(data) {
     const resultContent = document.getElementById('resultContent');
     const teamInfo = data.team_info || {};
+    const redeemedAt = teamInfo.redeemed_at || null;
+    const warrantyExpiresAt = teamInfo.warranty_expires_at || null;
 
     resultContent.innerHTML = `
         <div class="result-success">
@@ -232,12 +234,18 @@ function showSuccessResult(data) {
                     <span class="result-detail-label">邮箱地址</span>
                     <span class="result-detail-value">${escapeHtml(currentEmail)}</span>
                 </div>
-                ${teamInfo.expires_at ? `
                 <div class="result-detail-item">
-                    <span class="result-detail-label">到期时间</span>
-                    <span class="result-detail-value">${formatDate(teamInfo.expires_at)}</span>
+                    <span class="result-detail-label">Team 到期时间</span>
+                    <span class="result-detail-value">${formatDateTime(teamInfo.expires_at)}</span>
                 </div>
-                ` : ''}
+                <div class="result-detail-item">
+                    <span class="result-detail-label">质保到期时间</span>
+                    <span class="result-detail-value">${formatDateTime(warrantyExpiresAt)}</span>
+                </div>
+                <div class="result-detail-item">
+                    <span class="result-detail-label">兑换时间</span>
+                    <span class="result-detail-value">${formatDateTime(redeemedAt)}</span>
+                </div>
             </div>
 
             <p style="color: var(--text-muted); font-size: 0.9rem; margin-bottom: 2rem; background: rgba(255,255,255,0.05); padding: 1rem; border-radius: 8px; text-align: left;">
@@ -300,6 +308,22 @@ function formatDate(dateString) {
         const month = String(date.getMonth() + 1).padStart(2, '0');
         const day = String(date.getDate()).padStart(2, '0');
         return `${year}-${month}-${day}`;
+    } catch (e) {
+        return dateString;
+    }
+}
+
+// 格式化日期时间
+function formatDateTime(dateString) {
+    if (!dateString) return '-';
+    try {
+        const date = new Date(dateString);
+        const year = date.getFullYear();
+        const month = String(date.getMonth() + 1).padStart(2, '0');
+        const day = String(date.getDate()).padStart(2, '0');
+        const hour = String(date.getHours()).padStart(2, '0');
+        const minute = String(date.getMinutes()).padStart(2, '0');
+        return `${year}-${month}-${day} ${hour}:${minute}`;
     } catch (e) {
         return dateString;
     }
@@ -460,7 +484,7 @@ function showWarrantyResult(data) {
                                          <div style="font-weight: 500; display: flex; align-items: center; gap: 0.5rem; flex-wrap: wrap;">
                                              <span>${escapeHtml(record.team_name || '未知 Team')}</span>
                                              <span>${teamStatusBadge}</span>
-                                             ${(record.has_warranty && record.warranty_valid && record.team_status === 'banned') ? `
+                                             ${(record.has_warranty && record.warranty_valid && (record.team_status === 'banned' || record.team_status === 'expired')) ? `
                                              <button onclick="oneClickReplace('${escapeHtml(record.code)}', '${escapeHtml(record.email || currentEmail)}')" class="btn btn-xs btn-primary" style="padding: 2px 8px; font-size: 0.75rem; height: auto; min-height: 0;">
                                                  一键换车
                                              </button>
@@ -469,17 +493,17 @@ function showWarrantyResult(data) {
                                      </div>
                                      <div>
                                          <div style="color: var(--text-muted); margin-bottom: 0.2rem;">兑换时间</div>
-                                         <div>${formatDate(record.used_at)}</div>
+                                         <div>${formatDateTime(record.redeemed_at || record.used_at)}</div>
                                      </div>
                                      <div style="grid-column: span 2;">
                                          <div style="color: var(--text-muted); margin-bottom: 0.2rem;">Team 到期</div>
-                                         <div style="font-weight: 500;">${formatDate(record.team_expires_at)}</div>
+                                         <div style="font-weight: 500;">${formatDateTime(record.team_expires_at)}</div>
                                      </div>
                                     ${record.has_warranty ? `
                                     <div style="grid-column: span 2;">
                                         <div style="color: var(--text-muted); margin-bottom: 0.2rem;">质保到期</div>
                                         <div style="${record.warranty_valid ? 'color: var(--success);' : 'color: var(--danger);'}">
-                                            ${record.warranty_expires_at ? `${formatDate(record.warranty_expires_at)} ${record.warranty_valid ? '(有效)' : '(已过期)'}` : '尚未开始计算 (首次使用后开启)'}
+                                            ${record.warranty_expires_at ? `${formatDateTime(record.warranty_expires_at)} ${record.warranty_valid ? '(有效)' : '(已过期)'}` : '尚未开始计算 (首次使用后开启)'}
                                         </div>
                                     </div>
                                     ` : ''}
